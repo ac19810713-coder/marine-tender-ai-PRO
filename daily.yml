@@ -1,0 +1,35 @@
+name: Daily Marine Tender Brief
+
+on:
+  schedule:
+    # 台灣時間上午 8:00 = UTC 00:00
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  run-brief:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run daily tender brief
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_PASSWORD: ${{ secrets.GMAIL_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: python tender_brief.py
+
+      - name: Upload report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: marine-tender-report
+          path: output/*
