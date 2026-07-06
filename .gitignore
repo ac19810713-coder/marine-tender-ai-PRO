@@ -1,0 +1,6 @@
+.env
+*.log
+__pycache__/
+output/*.xlsx
+output/*.html
+output/*.csv
