@@ -1,14 +1,16 @@
 name: Daily Marine Tender Brief
 
 on:
-  schedule:
-    # 台灣時間上午 8:00 = UTC 00:00
-    - cron: '0 0 * * *'
   workflow_dispatch:
+  schedule:
+    # Taiwan 08:00 = UTC 00:00
+    - cron: '0 0 * * *'
 
 jobs:
   run-brief:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -21,15 +23,25 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run daily tender brief
+      - name: Run tender brief
         env:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_PASSWORD: ${{ secrets.GMAIL_PASSWORD }}
-          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          MAIL_TO: ${{ secrets.GMAIL_USER }}
+          MAIL_FROM: ${{ secrets.GMAIL_USER }}
         run: python tender_brief.py
 
       - name: Upload report artifact
         uses: actions/upload-artifact@v4
         with:
           name: marine-tender-report
-          path: output/*
+          path: out/
+          if-no-files-found: ignore
+
+      - name: Commit database updates
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/tenders.csv out/ || true
+          git diff --cached --quiet || git commit -m "daily tender brief update"
+          git push || true

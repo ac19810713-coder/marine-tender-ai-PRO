@@ -1,231 +1,194 @@
-"""
-海事工程 AI 情報中心
-- 每日搜尋政府採購相關公開資料
-- 依關鍵字篩選海事工程標案
-- 產出 Excel、HTML 報告
-- 用 Gmail SMTP 寄送晨報
-
-必要 GitHub Secrets:
-GMAIL_USER      你的 Gmail
-GMAIL_PASSWORD  Google 應用程式密碼，不是登入密碼
-
-選用 Secrets:
-EMAIL_TO        收件者，未設定則寄給 GMAIL_USER
-"""
-from __future__ import annotations
-
-import html
 import os
+import csv
 import smtplib
-from dataclasses import dataclass, asdict
-from datetime import datetime, timedelta, timezone
-from email.mime.application import MIMEApplication
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
+import ssl
+from datetime import datetime, timezone, timedelta
+from email.message import EmailMessage
 from pathlib import Path
-from typing import Iterable
+from typing import List, Dict
 
 import pandas as pd
 import requests
+from bs4 import BeautifulSoup
+
+ROOT = Path(__file__).resolve().parent
+DATA_DIR = ROOT / "data"
+OUT_DIR = ROOT / "out"
+DATA_DIR.mkdir(exist_ok=True)
+OUT_DIR.mkdir(exist_ok=True)
 
 TZ = timezone(timedelta(hours=8))
-ROOT = Path(__file__).resolve().parent
-OUTPUT = ROOT / "output"
-OUTPUT.mkdir(exist_ok=True)
-DATA = ROOT / "data"
-DATA.mkdir(exist_ok=True)
+TODAY = datetime.now(TZ).strftime("%Y-%m-%d")
 
-PCC_OPENFUN_API = "https://pcc.g0v.ronny.tw/api/searchbytitle"
+KEYWORDS = [x.strip() for x in (ROOT / "keywords.txt").read_text(encoding="utf-8").splitlines() if x.strip()]
+AGENCIES = [x.strip() for x in (ROOT / "agencies.txt").read_text(encoding="utf-8").splitlines() if x.strip()]
+DB_PATH = DATA_DIR / "tenders.csv"
 
-@dataclass
-class Tender:
-    date: str
-    agency: str
-    title: str
-    amount: str
-    deadline: str
-    status: str
-    url: str
-    matched_keywords: str
-    score: int
-    note: str
+# 這個公開 API 由第三方整理政府電子採購網資料。正式投標仍請回政府電子採購網公告確認。
+API = "https://pcc.g0v.ronny.tw/api/searchbytitle"
 
 
-def load_lines(name: str) -> list[str]:
-    path = ROOT / name
-    if not path.exists():
-        return []
-    return [x.strip() for x in path.read_text(encoding="utf-8").splitlines() if x.strip() and not x.strip().startswith("#")]
+def score_item(title: str, agency: str, summary: str) -> int:
+    text = f"{title} {agency} {summary}"
+    score = 0
+    for kw in KEYWORDS:
+        if kw in text:
+            score += 2
+    for ag in AGENCIES:
+        if ag in text:
+            score += 1
+    return score
 
 
-def fetch_pcc_by_keyword(keyword: str, timeout: int = 20) -> list[dict]:
-    """使用 pcc.g0v.ronny.tw 搜尋政府電子採購網標案標題。"""
+def fetch_pcc(keyword: str, limit: int = 20) -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
     try:
-        r = requests.get(PCC_OPENFUN_API, params={"query": keyword}, timeout=timeout)
+        r = requests.get(API, params={"query": keyword}, timeout=20)
         r.raise_for_status()
         data = r.json()
-        if isinstance(data, dict):
-            return data.get("records") or data.get("data") or []
-        return data if isinstance(data, list) else []
-    except Exception as exc:
-        print(f"[WARN] keyword={keyword} fetch failed: {exc}")
-        return []
+    except Exception as e:
+        return [{"date": TODAY, "source": "pcc-openfun", "agency": "查詢失敗", "title": keyword, "amount": "", "deadline": "", "url": "", "status": f"API error: {e}", "score": 0}]
+
+    records = data.get("records") or data.get("data") or []
+    for item in records[:limit]:
+        title = str(item.get("title") or item.get("標案名稱") or item.get("brief") or keyword)
+        agency = str(item.get("unit_name") or item.get("機關名稱") or item.get("unit") or "")
+        url = str(item.get("url") or item.get("link") or "")
+        amount = str(item.get("amount") or item.get("budget") or item.get("預算金額") or "")
+        deadline = str(item.get("deadline") or item.get("截止投標") or item.get("end_date") or "")
+        status = str(item.get("type") or item.get("status") or item.get("公告類別") or "")
+        summary = str(item)
+        sc = score_item(title, agency, summary)
+        if sc > 0:
+            rows.append({
+                "date": TODAY,
+                "source": "pcc-openfun",
+                "agency": agency,
+                "title": title,
+                "amount": amount,
+                "deadline": deadline,
+                "url": url,
+                "status": status,
+                "score": sc,
+            })
+    return rows
 
 
-def pick(row: dict, keys: Iterable[str], default: str = "") -> str:
-    for k in keys:
-        v = row.get(k)
-        if v not in (None, ""):
-            return str(v)
-    return default
+def dedupe(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    seen = set()
+    out = []
+    for r in sorted(rows, key=lambda x: int(x.get("score") or 0), reverse=True):
+        key = (r.get("agency", ""), r.get("title", ""), r.get("url", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
 
 
-def normalize_record(row: dict, keyword: str, keywords: list[str], agencies: list[str]) -> Tender | None:
-    title = pick(row, ["標案名稱", "title", "brief", "name"])
-    agency = pick(row, ["機關名稱", "unit_name", "agency", "機關"])
-    if not title and not agency:
-        return None
-    text = f"{title} {agency}"
-    matched = sorted({k for k in keywords if k in text} | ({keyword} if keyword in text else set()))
-    agency_hit = any(a in text for a in agencies if a != "政府電子採購網")
-    if not matched and not agency_hit:
-        return None
-
-    amount = pick(row, ["預算金額", "budget", "金額", "amount", "決標金額"], "未列")
-    deadline = pick(row, ["截止投標", "截止投標日期", "開標日期", "deadline", "date"], "未列")
-    status = pick(row, ["招標狀態", "status", "公告類別"], "待確認")
-    url = pick(row, ["url", "標案網址", "detail_url"])
-    if not url:
-        unit_id = pick(row, ["unit_id", "機關代碼"])
-        job_number = pick(row, ["job_number", "標案案號", "jobno"])
-        if unit_id and job_number:
-            url = f"https://pcc.g0v.ronny.tw/tender/{unit_id}/{job_number}"
-        else:
-            url = "https://web.pcc.gov.tw/"
-
-    score = 1
-    high_words = ["浚挖", "疏浚", "航道", "港池", "碼頭", "防波堤", "護岸", "水域維護", "養灘"]
-    score += sum(1 for w in high_words if w in text)
-    if agency_hit:
-        score += 2
-    score = min(score, 5)
-
-    note = "值得追蹤" if score >= 4 else "一般追蹤"
-    if score >= 5:
-        note = "高度符合海事工程，建議優先確認投標資格與工期"
-    elif any(w in text for w in ["港", "碼頭", "航道", "漁港"]):
-        note = "港區相關，建議查看圖說、船機限制與棄土條件"
-
-    return Tender(
-        date=datetime.now(TZ).strftime("%Y-%m-%d"),
-        agency=agency or "未列機關",
-        title=title or "未列標題",
-        amount=amount,
-        deadline=deadline,
-        status=status,
-        url=url,
-        matched_keywords=", ".join(matched),
-        score=score,
-        note=note,
-    )
+def load_old_titles() -> set:
+    if not DB_PATH.exists():
+        return set()
+    try:
+        df = pd.read_csv(DB_PATH)
+        return set(df.get("title", pd.Series(dtype=str)).astype(str).tolist())
+    except Exception:
+        return set()
 
 
-def collect_tenders() -> list[Tender]:
-    keywords = load_lines("keywords.txt")
-    agencies = load_lines("agencies.txt")
-    items: dict[str, Tender] = {}
-    for keyword in keywords:
-        for row in fetch_pcc_by_keyword(keyword):
-            tender = normalize_record(row, keyword, keywords, agencies)
-            if tender:
-                key = f"{tender.agency}|{tender.title}|{tender.deadline}"
-                old = items.get(key)
-                if old is None or tender.score > old.score:
-                    items[key] = tender
-    return sorted(items.values(), key=lambda x: x.score, reverse=True)
+def save_db(rows: List[Dict[str, str]]):
+    df_new = pd.DataFrame(rows)
+    if DB_PATH.exists():
+        try:
+            df_old = pd.read_csv(DB_PATH)
+            df = pd.concat([df_old, df_new], ignore_index=True)
+        except Exception:
+            df = df_new
+    else:
+        df = df_new
+    if not df.empty:
+        df = df.drop_duplicates(subset=["agency", "title", "url"], keep="last")
+    df.to_csv(DB_PATH, index=False, encoding="utf-8-sig")
 
 
-def make_excel(tenders: list[Tender], path: Path) -> None:
-    df = pd.DataFrame([asdict(t) for t in tenders])
+def make_reports(rows: List[Dict[str, str]], old_titles: set):
+    df = pd.DataFrame(rows)
     if df.empty:
-        df = pd.DataFrame(columns=list(Tender.__dataclass_fields__.keys()))
-    with pd.ExcelWriter(path, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="今日摘要")
-        top = df.head(20)
-        top.to_excel(writer, index=False, sheet_name="優先追蹤")
+        df = pd.DataFrame(columns=["date", "source", "agency", "title", "amount", "deadline", "url", "status", "score"])
+    df["is_new"] = ~df["title"].astype(str).isin(old_titles) if not df.empty else []
+    xlsx = OUT_DIR / f"marine_tender_report_{TODAY}.xlsx"
+    html = OUT_DIR / f"marine_tender_report_{TODAY}.html"
+    df.to_excel(xlsx, index=False)
 
-
-def make_html(tenders: list[Tender]) -> str:
-    today = datetime.now(TZ).strftime("%Y/%m/%d")
-    top = tenders[:10]
-    rows = []
-    for i, t in enumerate(top, 1):
-        stars = "★" * t.score + "☆" * (5 - t.score)
-        rows.append(f"""
-        <tr>
-          <td>{i}</td>
-          <td><b>{html.escape(t.title)}</b><br><small>{html.escape(t.agency)}</small></td>
-          <td>{html.escape(t.amount)}</td>
-          <td>{html.escape(t.deadline)}</td>
-          <td>{stars}<br>{html.escape(t.note)}</td>
-          <td><a href=\"{html.escape(t.url)}\">公告連結</a></td>
-        </tr>
-        """)
-    if not rows:
-        rows.append("<tr><td colspan='6'>今天沒有抓到符合條件的標案。仍建議人工確認政府電子採購網，因為政府網站偶爾像睡著的石像。</td></tr>")
-    return f"""
+    top = df.head(20).to_dict("records") if not df.empty else []
+    rows_html = "".join(
+        f"<tr><td>{r.get('agency','')}</td><td>{r.get('title','')}</td><td>{r.get('amount','')}</td><td>{r.get('deadline','')}</td><td>{r.get('status','')}</td><td><a href='{r.get('url','')}'>連結</a></td><td>{r.get('score','')}</td></tr>"
+        for r in top
+    )
+    new_count = int(df["is_new"].sum()) if not df.empty and "is_new" in df else 0
+    body = f"""
     <html><body>
-    <h2>海事工程每日晨報 {today}</h2>
-    <p>今日符合關鍵字標案：<b>{len(tenders)}</b> 件。以下列出優先追蹤前 10 件。</p>
-    <h3>今日重點</h3>
-    <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-family:Arial,'Microsoft JhengHei',sans-serif;font-size:14px;">
-      <tr style="background:#eee"><th>#</th><th>標案</th><th>預算/金額</th><th>截止/日期</th><th>AI追蹤評分</th><th>連結</th></tr>
-      {''.join(rows)}
-    </table>
-    <h3>後續值得追蹤</h3>
+    <h2>海事工程 AI 情報中心 - {TODAY}</h2>
+    <p>今日找到 {len(df)} 筆相關資料，其中可能新增 {new_count} 筆。</p>
+    <h3>AI 重點判讀</h3>
     <ul>
-      <li>分數 4 星以上：優先下載招標文件、圖說、工期、船機限制。</li>
-      <li>涉及浚挖、港池、航道、棄土者：注意棄置場、運距、污染檢測、天候停工條件。</li>
-      <li>決標與變更公告仍需回政府電子採購網正式公告確認。</li>
+      <li>分數越高，代表越符合海事、浚挖、港區、碼頭、護岸、防波堤等關鍵字。</li>
+      <li>正式投標前，務必回政府電子採購網或招標機關原公告確認。政府網站嘛，最後還是它說了算。</li>
+      <li>建議優先查看分數高、金額大、截止日近的案件。</li>
     </ul>
-    <p style="color:#666;font-size:12px">本報告由 GitHub Actions 自動產生。正式投標請以官方公告與招標文件為準。</p>
+    <table border="1" cellpadding="6" cellspacing="0">
+      <tr><th>機關</th><th>標案名稱</th><th>預算/金額</th><th>截止</th><th>狀態</th><th>連結</th><th>分數</th></tr>
+      {rows_html}
+    </table>
     </body></html>
     """
+    html.write_text(body, encoding="utf-8")
+    return html, xlsx, body
 
 
-def send_email(subject: str, html_body: str, attachments: list[Path]) -> None:
-    user = os.environ.get("GMAIL_USER")
-    password = os.environ.get("GMAIL_PASSWORD")
-    to_addr = os.environ.get("EMAIL_TO") or user
-    if not user or not password:
-        print("[INFO] GMAIL_USER/GMAIL_PASSWORD not set. Skip email.")
+def send_mail(subject: str, html_body: str, attachments: List[Path]):
+    user = os.getenv("GMAIL_USER")
+    password = os.getenv("GMAIL_PASSWORD")
+    to = os.getenv("MAIL_TO") or user
+    mail_from = os.getenv("MAIL_FROM") or user
+    if not user or not password or not to:
+        print("GMAIL_USER / GMAIL_PASSWORD not set, skip email.")
         return
-    msg = MIMEMultipart()
-    msg["From"] = user
-    msg["To"] = to_addr
+
+    msg = EmailMessage()
     msg["Subject"] = subject
-    msg.attach(MIMEText(html_body, "html", "utf-8"))
-    for path in attachments:
-        if path.exists():
-            part = MIMEApplication(path.read_bytes(), Name=path.name)
-            part["Content-Disposition"] = f'attachment; filename="{path.name}"'
-            msg.attach(part)
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(user, password)
-        server.sendmail(user, [to_addr], msg.as_string())
-    print(f"[OK] email sent to {to_addr}")
+    msg["From"] = mail_from
+    msg["To"] = to
+    msg.set_content("你的 Email 不支援 HTML，請查看附件報表。")
+    msg.add_alternative(html_body, subtype="html")
+
+    for p in attachments:
+        if not p.exists():
+            continue
+        data = p.read_bytes()
+        if p.suffix == ".xlsx":
+            maintype, subtype = "application", "vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        else:
+            maintype, subtype = "text", "html"
+        msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=p.name)
+
+    context = ssl.create_default_context()
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as smtp:
+        smtp.login(user, password)
+        smtp.send_message(msg)
 
 
-def main() -> None:
-    tenders = collect_tenders()
-    today = datetime.now(TZ).strftime("%Y%m%d")
-    xlsx = OUTPUT / f"marine_tender_brief_{today}.xlsx"
-    html_path = OUTPUT / f"marine_tender_brief_{today}.html"
-    make_excel(tenders, xlsx)
-    html_body = make_html(tenders)
-    html_path.write_text(html_body, encoding="utf-8")
-    send_email(f"海事工程每日晨報 {datetime.now(TZ).strftime('%Y/%m/%d')}", html_body, [xlsx])
-    print(f"[OK] generated: {xlsx}")
+def main():
+    old_titles = load_old_titles()
+    all_rows: List[Dict[str, str]] = []
+    for kw in KEYWORDS:
+        all_rows.extend(fetch_pcc(kw, limit=15))
+    rows = dedupe(all_rows)
+    save_db(rows)
+    html_path, xlsx_path, html_body = make_reports(rows, old_titles)
+    send_mail(f"海事工程標案每日摘要 {TODAY}", html_body, [html_path, xlsx_path])
+    print(f"done. rows={len(rows)}")
+
 
 if __name__ == "__main__":
     main()
